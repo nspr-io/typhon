@@ -26,6 +26,9 @@ type Response struct {
 	hijacked bool
 }
 
+var OptionDiscardUnknown bool
+var OptionAllowPartial bool
+
 // Encode serialises the passed object into the body (and sets appropriate headers).
 func (r *Response) Encode(v interface{}) {
 	if r.Response == nil {
@@ -171,10 +174,12 @@ func (r *Response) Decode(v interface{}) error {
 			"application/protobuf",
 			"application/x-protobuf":
 
-			err = proto.Unmarshal(b, m)
+			unmarshalOptions := proto.UnmarshalOptions{DiscardUnknown: OptionDiscardUnknown, AllowPartial: OptionAllowPartial}
+			err = unmarshalOptions.Unmarshal(b, m)
 		default:
 
-			err = protojson.Unmarshal(b, m)
+			unmarshalOptions := protojson.UnmarshalOptions{DiscardUnknown: OptionDiscardUnknown, AllowPartial: OptionAllowPartial}
+			err = unmarshalOptions.Unmarshal(b, m)
 		}
 
 	// If we have a legacy protobuf message, decode as protobuf if that's signalled, but use standard JSON otherwise.
