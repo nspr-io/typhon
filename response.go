@@ -178,6 +178,14 @@ func (r *Response) Decode(v interface{}) error {
 			err = unmarshalOptions.Unmarshal(b, m)
 		default:
 
+			// nspr-io patch: strict wire-key check before protojson
+			// accepts snake_case aliases. See strict_wire_keys.go.
+			if OptionStrictWireKeys {
+				if strictErr := ValidateStrictWireKeys(b, m.ProtoReflect().Descriptor()); strictErr != nil {
+					r.Error = terrors.WrapWithCode(strictErr, nil, terrors.ErrBadResponse)
+					return r.Error
+				}
+			}
 			unmarshalOptions := protojson.UnmarshalOptions{DiscardUnknown: OptionDiscardUnknown, AllowPartial: OptionAllowPartial}
 			err = unmarshalOptions.Unmarshal(b, m)
 		}

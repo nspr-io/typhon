@@ -7,10 +7,12 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"reflect"
 	"strings"
 
 	legacyproto "github.com/golang/protobuf/proto"
 	"github.com/monzo/terrors"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -48,10 +50,16 @@ func (r *Request) Encode(v interface{}) {
 }
 
 // EncodeAsJSON serialises the passed object as JSON into the body (and sets appropriate headers).
+//
+// nspr-io patch: proto.Message values are encoded via protojson.Marshal so
+// wire bodies emit camelCase (proto json_name) on outbound requests, matching
+// the decode side which requires camelCase strictly. Value-typed proto
+// structs (proto.Message is implemented on the pointer receiver) are handled
+// via reflection.
 func (r *Request) EncodeAsJSON(v interface{}) {
 	// If we were given an io.ReadCloser or an io.Reader (that is not also a json.Marshaler), use it directly
 	switch v := v.(type) {
-	case json.Marshaler:
+	case proto.Message, json.Marshaler:
 	case io.ReadCloser:
 		r.Body = v
 		r.ContentLength = -1
@@ -62,11 +70,60 @@ func (r *Request) EncodeAsJSON(v interface{}) {
 		return
 	}
 
+	if m := asProtoMessage(v); m != nil {
+		r.EncodeAsProtobufJSON(m)
+		return
+	}
+
 	if err := json.NewEncoder(r).Encode(v); err != nil {
 		r.err = terrors.Wrap(err, nil)
 		return
 	}
 	r.Header.Set("Content-Type", "application/json")
+}
+
+// asProtoMessage returns v as a proto.Message, taking the address of struct
+// values whose pointer type implements proto.Message (typhon clients pass
+// request bodies by value).
+func asProtoMessage(v interface{}) proto.Message {
+	if v == nil {
+		return nil
+	}
+	if m, ok := v.(proto.Message); ok {
+		return m
+	}
+	rv := reflect.ValueOf(v)
+	if rv.Kind() == reflect.Struct && rv.CanAddr() {
+		if m, ok := rv.Addr().Interface().(proto.Message); ok {
+			return m
+		}
+	}
+	// Wrap in an addressable copy so we can take &v's concrete type.
+	if rv.Kind() == reflect.Struct {
+		addr := reflect.New(rv.Type())
+		addr.Elem().Set(rv)
+		if m, ok := addr.Interface().(proto.Message); ok {
+			return m
+		}
+	}
+	return nil
+}
+
+// EncodeAsProtobufJSON writes well-formed protobuf JSON (camelCase json_names)
+// to the request body and sets Content-Type: application/json.
+func (r *Request) EncodeAsProtobufJSON(m proto.Message) {
+	b, err := protojson.Marshal(m)
+	if err != nil {
+		r.err = terrors.Wrap(err, nil)
+		return
+	}
+	n, err := r.Write(b)
+	if err != nil {
+		r.err = terrors.Wrap(err, nil)
+		return
+	}
+	r.Header.Set("Content-Type", "application/json")
+	r.ContentLength = int64(n)
 }
 
 // EncodeAsProtobuf serialises the passed object as protobuf into the body (and sets appropriate headers).
@@ -109,7 +166,29 @@ func (r Request) Decode(v interface{}) error {
 	// As older versions of typhon used json, we don't use protojson here as they are mutually exclusive standards with
 	// major differences in how they handle some types (such as Enums)
 	default:
-		err = json.Unmarshal(b, v)
+		// nspr-io patch: strict wire-key check for proto request
+		// bodies. encoding/json is case-insensitive and happily
+		// accepts snake/camel/alt-case drift; this pass rejects any
+		// key that doesn't match the proto's json_name exactly. Only
+		// runs when OptionStrictWireKeys is set (e2e tests).
+		// See strict_wire_keys.go.
+		if OptionStrictWireKeys {
+			if m, ok := v.(proto.Message); ok {
+				if strictErr := ValidateStrictWireKeys(b, m.ProtoReflect().Descriptor()); strictErr != nil {
+					return terrors.WrapWithCode(strictErr, nil, terrors.ErrBadRequest)
+				}
+			}
+		}
+		// nspr-io patch: when the caller expects a proto.Message, use
+		// protojson so camelCase json_names populate the struct
+		// correctly. Plain encoding/json only matches struct tags
+		// (snake_case) and silently drops unmatched camelCase keys.
+		if m, ok := v.(proto.Message); ok {
+			unmarshalOptions := protojson.UnmarshalOptions{DiscardUnknown: OptionDiscardUnknown, AllowPartial: OptionAllowPartial}
+			err = unmarshalOptions.Unmarshal(b, m)
+		} else {
+			err = json.Unmarshal(b, v)
+		}
 	}
 
 	return terrors.WrapWithCode(err, nil, terrors.ErrBadRequest)
